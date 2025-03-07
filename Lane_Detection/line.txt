@@ -1,0 +1,418 @@
+import numpy as np
+import cv2
+import glob
+import collections
+import matplotlib.pyplot as plt
+from calibration import calibrate_camera, undistort
+from thresholding import binarize
+from prespective_view import birdeye
+from globals import ym_per_pix, xm_per_pix
+
+
+class Line:
+    """
+    Class to model a lane-line.
+    """
+    def __init__(self, buffer_len=10):
+        # Шугам сүүлийн итерацид илэрсэн эсэхийг тэмдэглэх хувьсагч
+        self.detected = False
+
+        # Сүүлийн итерацид олдсон олон гишүүнт (полином) коэффициентүүд
+        self.last_fit_pixel = None  # Пикселийн координатаар
+        self.last_fit_meter = None  # Метрийн координатаар
+
+        # Сүүлийн N итерацийн олон гишүүнт коэффициентүүдийг хадгалах санах ой (deque)
+        self.recent_fits_pixel = collections.deque(maxlen=buffer_len)  # Пикселийн координатаар
+        self.recent_fits_meter = collections.deque(maxlen=2 * buffer_len)  # Метрийн координатаар
+
+        # Муруйлтын радиус хадгалах хувьсагч
+        self.radius_of_curvature = None
+
+        # Шугам илэрсэн бүх пикселийн (x, y) координатуудыг хадгалах
+        self.all_x = None
+        self.all_y = None
+
+    def update_line(self, new_fit_pixel, new_fit_meter, detected, clear_buffer=False):
+        """
+        Шинэ тохируулсан (фит) коэффициентүүдээр шугамын мэдээллийг шинэчлэх функц.
+        
+        :param new_fit_pixel: шинэ тохируулсан олон гишүүнтийн коэффициентүүд (пиксел)
+        :param new_fit_meter: шинэ тохируулсан олон гишүүнтийн коэффициентүүд (метр)
+        :param detected: энэ удаагийн итерацид шугам илэрсэн эсэх
+        :param clear_buffer: True байвал өмнөх мэдээллийг устгана
+        """
+        self.detected = detected
+
+        if clear_buffer:
+            # Хэрэв buffer-г устгах бол өмнөх хадгалсан өгөгдлүүдийг хоослох
+            self.recent_fits_pixel = collections.deque(maxlen=len(self.recent_fits_pixel))
+            self.recent_fits_meter = collections.deque(maxlen=len(self.recent_fits_meter))
+
+        # Сүүлийн тохируулсан коэффициентүүдийг хадгалах
+        self.last_fit_pixel = new_fit_pixel
+        self.last_fit_meter = new_fit_meter
+
+        # Санах ойд (deque) шинэ коэффициентүүдийг нэмэх
+        self.recent_fits_pixel.append(self.last_fit_pixel)
+        self.recent_fits_meter.append(self.last_fit_meter)
+
+
+    def draw(self, mask, color=(255, 0, 0), line_width=30, average=False):
+        """
+        Өгөгдсөн маскны (зураг) дээр шугам зурах функц.
+        
+        :param mask: дүрсний массив
+        :param color: шугамын өнгө (RGB)
+        :param line_width: шугамын өргөн
+        :param average: үнэлгээний коэффициентүүдийг дундажлах эсэх
+        """
+        h, w, c = mask.shape  # Маскны (зураг) хэмжээ авах
+
+        # Y тэнхлэгийн утгуудыг үүсгэх (зурагны өндрийн дагуу)
+        plot_y = np.linspace(0, h - 1, h)
+
+        # Дундаж утга авах эсэхийг шалгах
+        coeffs = self.average_fit if average else self.last_fit_pixel
+
+        # Олон гишүүнт функц ашиглан X координатуудыг тооцоолох
+        line_center = coeffs[0] * plot_y ** 2 + coeffs[1] * plot_y + coeffs[2]
+        line_left_side = line_center - line_width // 2  # Шугамын зүүн талын ирмэг
+        line_right_side = line_center + line_width // 2  # Шугамын баруун талын ирмэг
+
+        # OpenCV-ийн fillPoly() функцэд тохируулах X, Y координатуудыг бэлтгэх
+        pts_left = np.array(list(zip(line_left_side, plot_y)))  # Зүүн ирмэгийн координатууд
+        pts_right = np.array(np.flipud(list(zip(line_right_side, plot_y))))  # Баруун ирмэгийн координатууд
+        pts = np.vstack([pts_left, pts_right])  # Хоёр талыг нэг массив болгох
+
+        # Шугамыг дүрсний маскан дээр зурж буцаах
+        return cv2.fillPoly(mask, [np.int32(pts)], color)
+
+    @property
+    # Сүүлийн N давталтын олонлогийн (recent_fits_pixel) дундаж олон гишүүнтийн коэффициентийг буцаана
+    def average_fit(self):
+        return np.mean(self.recent_fits_pixel, axis=0)  # numpy-г ашиглан бүх коэффициентийн дунджийг тооцоолно
+
+    @property
+    # Шугамын муруйлтын радиусыг тооцоолно (пиксел дээр суурилсан), Томъёо нь муруйлтын радиусыг пикселийн хэмжээс дээр гаргана.
+    def curvature(self):
+        y_eval = 0  # y_eval = 0 гэдэг нь муруйлтын радиусыг замын доод талд (зургийн y=0 хэсэгт) тооцоолно гэсэн үг.
+        coeffs = self.average_fit  # Сүүлийн N давталтын дундаж коэффициентийг авна
+        #curvature нь шугамын муруйлтын радиусыг тооцоолох математик томъёог ашиглана.
+        # Муурийлтын радиусыг тооцох томъёо:
+        return ((1 + (2 * coeffs[0] * y_eval + coeffs[1]) ** 2) ** 1.5) / np.absolute(2 * coeffs[0])
+
+    @property
+    # Шугамын муруйлтын радиусыг метрт хувирган тооцоолно
+    def curvature_meter(self):
+        y_eval = 0  # Муурийлтын радиусыг шалгах өндөр (ихэвчлэн y=0)
+        coeffs = np.mean(self.recent_fits_meter, axis=0)  # Сүүлийн N давталтын метрт хувиргасан коэффициентийн дундаж
+        
+        # Муурийлтын радиусыг бодит ертөнцийн хэмжээс (метр) дээр тооцох
+        return ((1 + (2 * coeffs[0] * y_eval + coeffs[1]) ** 2) ** 1.5) / np.absolute(2 * coeffs[0])
+
+
+def get_fits_by_sliding_windows(birdeye_binary, line_lt, line_rt, n_windows=9, verbose=False):
+    """
+    Lane line илрүүлэх зориулалттай олон цонхны (sliding windows) арга
+    :param birdeye_binary: шувууны нүдээр харах хоёртын дүрсийг оруулна
+    :param line_lt: зүүн эгнээний шугамыг өмнө нь илрүүлсэн
+    :param line_rt: зүүн эгнээний шугамыг өмнө нь илрүүлсэн
+    :param n_windows: мөр хайхад ашигладаг гүйдэг цонхны тоо
+    :param verbose: Хэрэв үнэн бол завсрын гаралтыг харуулна
+    :return: шинэчлэгдсэн эгнээний шугам ба гаралтын зураг
+    """
+    height, width = birdeye_binary.shape  # Зургийн өндөр, өргөнийг тодорхойлох
+
+    # Зурагны доод хэсгийн гистограммыг тооцоолох (замын шугамыг олохын тулд)
+    histogram = np.sum(birdeye_binary[height//2:-30, :], axis=0)
+
+    # Харагдах байдлыг сайжруулах зорилгоор 3 сувагтай дүрс үүсгэх
+    out_img = np.dstack((birdeye_binary, birdeye_binary, birdeye_binary)) * 255
+
+    # Зүүн болон баруун замын шугамын эхлэлийн цэгийг тодорхойлох
+    midpoint = len(histogram) // 2
+    leftx_base = np.argmax(histogram[:midpoint])  # Зүүн талын шугам
+    rightx_base = np.argmax(histogram[midpoint:]) + midpoint  # Баруун талын шугам
+
+    # Цонхны өндөр тодорхойлох
+    window_height = np.int32(height / n_windows)
+
+    # Бүх ногоон өнгөтэй пикселүүдийг олох
+    nonzero = birdeye_binary.nonzero()
+    nonzero_y = np.array(nonzero[0])
+    nonzero_x = np.array(nonzero[1])
+
+    # Одоогийн цонхны байрлалыг хадгалах хувьсагчууд
+    leftx_current = leftx_base
+    rightx_current = rightx_base
+
+    margin = 100  # Цонхны өргөн
+    minpix = 50   # Цонх шинэчлэгдэхийн тулд олох ёстой хамгийн бага пиксел
+
+    left_lane_inds = []  # Зүүн шугамын пикселүүд
+    right_lane_inds = []  # Баруун шугамын пикселүүд
+
+    # Олон цонхны аргаар замын шугам илрүүлэх
+    for window in range(n_windows):
+        # Цонхны хил хязгаарыг тодорхойлох
+        win_y_low = height - (window + 1) * window_height
+        win_y_high = height - window * window_height
+        win_xleft_low = leftx_current - margin
+        win_xleft_high = leftx_current + margin
+        win_xright_low = rightx_current - margin
+        win_xright_high = rightx_current + margin
+
+        # Цонхыг дүрсэн дээр зурж харагдуулах
+        cv2.rectangle(out_img, (win_xleft_low, win_y_low), (win_xleft_high, win_y_high), (0, 255, 0), 2)
+        cv2.rectangle(out_img, (win_xright_low, win_y_low), (win_xright_high, win_y_high), (0, 255, 0), 2)
+
+        # Цонхон дотор байгаа пикселүүдийг олох
+        good_left_inds = ((nonzero_y >= win_y_low) & (nonzero_y < win_y_high) & (nonzero_x >= win_xleft_low)
+                          & (nonzero_x < win_xleft_high)).nonzero()[0]
+        good_right_inds = ((nonzero_y >= win_y_low) & (nonzero_y < win_y_high) & (nonzero_x >= win_xright_low)
+                           & (nonzero_x < win_xright_high)).nonzero()[0]
+
+        left_lane_inds.append(good_left_inds)
+        right_lane_inds.append(good_right_inds)
+
+        # Хэрэв хангалттай пиксел байвал цонхны байрлалыг шинэчлэх
+        if len(good_left_inds) > minpix:
+            leftx_current = np.int32(np.mean(nonzero_x[good_left_inds]))
+        if len(good_right_inds) > minpix:
+            rightx_current = np.int32(np.mean(nonzero_x[good_right_inds]))
+
+    # Олдсон пикселүүдийг нэгтгэх
+    left_lane_inds = np.concatenate(left_lane_inds)
+    right_lane_inds = np.concatenate(right_lane_inds)
+
+    # Замын шугамын пикселийн байрлалуудыг хадгалах
+    line_lt.all_x, line_lt.all_y = nonzero_x[left_lane_inds], nonzero_y[left_lane_inds]
+    line_rt.all_x, line_rt.all_y = nonzero_x[right_lane_inds], nonzero_y[right_lane_inds]
+
+    # Полином тааруулах (олсон пикселүүдээс замын шугам олох)
+    detected = True
+    if not list(line_lt.all_x) or not list(line_lt.all_y):
+        left_fit_pixel = line_lt.last_fit_pixel
+        left_fit_meter = line_lt.last_fit_meter
+        detected = False
+    else:
+        left_fit_pixel = np.polyfit(line_lt.all_y, line_lt.all_x, 2)
+        left_fit_meter = np.polyfit(line_lt.all_y * ym_per_pix, line_lt.all_x * xm_per_pix, 2)
+
+    if not list(line_rt.all_x) or not list(line_rt.all_y):
+        right_fit_pixel = line_rt.last_fit_pixel
+        right_fit_meter = line_rt.last_fit_meter
+        detected = False
+    else:
+        right_fit_pixel = np.polyfit(line_rt.all_y, line_rt.all_x, 2)
+        right_fit_meter = np.polyfit(line_rt.all_y * ym_per_pix, line_rt.all_x * xm_per_pix, 2)
+
+    # Замын шугамын шинэчилсэн мэдээллийг хадгалах
+    line_lt.update_line(left_fit_pixel, left_fit_meter, detected=detected)
+    line_rt.update_line(right_fit_pixel, right_fit_meter, detected=detected)
+
+    # Дүрсэн дээр харуулах шугамуудын координатыг үүсгэх
+    ploty = np.linspace(0, height - 1, height)
+    left_fitx = left_fit_pixel[0] * ploty ** 2 + left_fit_pixel[1] * ploty + left_fit_pixel[2]
+    right_fitx = right_fit_pixel[0] * ploty ** 2 + right_fit_pixel[1] * ploty + right_fit_pixel[2]
+
+    # Зүүн, баруун шугамын пикселүүдийг улаан болон цэнхэр өнгөөр будаж харагдуулах
+    out_img[nonzero_y[left_lane_inds], nonzero_x[left_lane_inds]] = [255, 0, 0]
+    out_img[nonzero_y[right_lane_inds], nonzero_x[right_lane_inds]] = [0, 0, 255]
+
+    if verbose:
+        plt.imshow(out_img)
+        plt.plot(left_fitx, ploty, color='yellow')
+        plt.plot(right_fitx, ploty, color='yellow')
+        plt.show()
+
+    return line_lt, line_rt, out_img
+
+
+def get_fits_by_previous_fits(birdeye_binary, line_lt, line_rt, verbose=False):
+    """
+    Өмнөх илрүүлсэн замын шугамуудыг ашиглан одоогийн фрэймийн замын шугамуудыг хурдан илрүүлэх функц.
+    
+    :param birdeye_binary: оролтын шувууны нүдний харагдацтай хоёртын зураг
+    :param line_lt: өмнөх илрүүлсэн зүүн замын шугам
+    :param line_rt: өмнөх илрүүлсэн баруун замын шугам
+    :param verbose: хэрэв True бол завсрын үр дүнг харуулна
+    :return: шинэчлэгдсэн замын шугамууд болон гаралтын зураг
+    """
+
+    height, width = birdeye_binary.shape  # Зургийн өндөр, өргөнийг тодорхойлох
+
+    left_fit_pixel = line_lt.last_fit_pixel  # Өмнөх зүүн шугамын коэффициентууд
+    right_fit_pixel = line_rt.last_fit_pixel  # Өмнөх баруун шугамын коэффициентууд
+
+    nonzero = birdeye_binary.nonzero()  # Зураг дахь 0-ээс ялгаатай пикселүүдийг авах
+    nonzero_y = np.array(nonzero[0])
+    nonzero_x = np.array(nonzero[1])
+    margin = 100  # Хайх талбайн өргөн
+
+    # Өмнөх шугамын дагуу хайж олох
+    left_lane_inds = (
+        (nonzero_x > (left_fit_pixel[0] * (nonzero_y ** 2) + left_fit_pixel[1] * nonzero_y + left_fit_pixel[2] - margin)) &
+        (nonzero_x < (left_fit_pixel[0] * (nonzero_y ** 2) + left_fit_pixel[1] * nonzero_y + left_fit_pixel[2] + margin))
+    )
+    right_lane_inds = (
+        (nonzero_x > (right_fit_pixel[0] * (nonzero_y ** 2) + right_fit_pixel[1] * nonzero_y + right_fit_pixel[2] - margin)) &
+        (nonzero_x < (right_fit_pixel[0] * (nonzero_y ** 2) + right_fit_pixel[1] * nonzero_y + right_fit_pixel[2] + margin))
+    )
+
+    # Илэрсэн пикселүүдийг хадгалах
+    line_lt.all_x, line_lt.all_y = nonzero_x[left_lane_inds], nonzero_y[left_lane_inds]
+    line_rt.all_x, line_rt.all_y = nonzero_x[right_lane_inds], nonzero_y[right_lane_inds]
+
+    detected = True  # Замын шугам илэрсэн эсэхийг тэмдэглэх
+    if not list(line_lt.all_x) or not list(line_lt.all_y):
+        left_fit_pixel = line_lt.last_fit_pixel
+        left_fit_meter = line_lt.last_fit_meter
+        detected = False
+    else:
+        left_fit_pixel = np.polyfit(line_lt.all_y, line_lt.all_x, 2)  # Зүүн шугамыг дахин тохируулах
+        left_fit_meter = np.polyfit(line_lt.all_y * ym_per_pix, line_lt.all_x * xm_per_pix, 2)
+
+    if not list(line_rt.all_x) or not list(line_rt.all_y):
+        right_fit_pixel = line_rt.last_fit_pixel
+        right_fit_meter = line_rt.last_fit_meter
+        detected = False
+    else:
+        right_fit_pixel = np.polyfit(line_rt.all_y, line_rt.all_x, 2)  # Баруун шугамыг дахин тохируулах
+        right_fit_meter = np.polyfit(line_rt.all_y * ym_per_pix, line_rt.all_x * xm_per_pix, 2)
+
+    line_lt.update_line(left_fit_pixel, left_fit_meter, detected=detected)
+    line_rt.update_line(right_fit_pixel, right_fit_meter, detected=detected)
+
+    # Шугам зурж харуулах өгөгдлүүдийг үүсгэх
+    ploty = np.linspace(0, height - 1, height)
+    left_fitx = left_fit_pixel[0] * ploty ** 2 + left_fit_pixel[1] * ploty + left_fit_pixel[2]
+    right_fitx = right_fit_pixel[0] * ploty ** 2 + right_fit_pixel[1] * ploty + right_fit_pixel[2]
+
+    # Хайлт хийх цонх болон шугамыг дүрслэх зураг үүсгэх
+    img_fit = np.dstack((birdeye_binary, birdeye_binary, birdeye_binary)) * 255
+    window_img = np.zeros_like(img_fit)
+
+    # Шугамуудыг тэмдэглэх
+    img_fit[nonzero_y[left_lane_inds], nonzero_x[left_lane_inds]] = [255, 0, 0]
+    img_fit[nonzero_y[right_lane_inds], nonzero_x[right_lane_inds]] = [0, 0, 255]
+
+    # Хайлт хийх цонхны хүрээг харуулах
+    left_line_window1 = np.array([np.transpose(np.vstack([left_fitx - margin, ploty]))])
+    left_line_window2 = np.array([np.flipud(np.transpose(np.vstack([left_fitx + margin, ploty])))])
+    left_line_pts = np.hstack((left_line_window1, left_line_window2))
+    right_line_window1 = np.array([np.transpose(np.vstack([right_fitx - margin, ploty]))])
+    right_line_window2 = np.array([np.flipud(np.transpose(np.vstack([right_fitx + margin, ploty])))])
+    right_line_pts = np.hstack((right_line_window1, right_line_window2))
+
+    # Ногоон өнгөөр шугамуудын хүрээг тэмдэглэх
+    cv2.fillPoly(window_img, np.int_([left_line_pts]), (0, 255, 0))
+    cv2.fillPoly(window_img, np.int_([right_line_pts]), (0, 255, 0))
+    result = cv2.addWeighted(img_fit, 1, window_img, 0.3, 0)
+
+    # Дүрслэл гаргах
+    if verbose:
+        plt.imshow(result)
+        plt.plot(left_fitx, ploty, color='yellow')
+        plt.plot(right_fitx, ploty, color='yellow')
+        plt.xlim(0, 1280)
+        plt.ylim(720, 0)
+
+        plt.show()
+
+    return line_lt, line_rt, img_fit
+
+
+
+def get_fits_by_previous_fits(birdeye_binary, line_lt, line_rt, verbose=False):
+    """
+    Өмнөх илрүүлсэн замын шугамуудыг ашиглан одоогийн фрэймийн замын шугамуудыг хурдан илрүүлэх функц.
+    
+    :param birdeye_binary: оролтын шувууны нүдний харагдацтай хоёртын зураг
+    :param line_lt: өмнөх илрүүлсэн зүүн замын шугам
+    :param line_rt: өмнөх илрүүлсэн баруун замын шугам
+    :param verbose: хэрэв True бол завсрын үр дүнг харуулна
+    :return: шинэчлэгдсэн замын шугамууд болон гаралтын зураг
+    """
+
+    height, width = birdeye_binary.shape  # Зургийн өндөр, өргөнийг тодорхойлох
+
+    left_fit_pixel = line_lt.last_fit_pixel  # Өмнөх зүүн шугамын коэффициентууд
+    right_fit_pixel = line_rt.last_fit_pixel  # Өмнөх баруун шугамын коэффициентууд
+
+    nonzero = birdeye_binary.nonzero()  # Зураг дахь 0-ээс ялгаатай пикселүүдийг авах
+    nonzero_y = np.array(nonzero[0])
+    nonzero_x = np.array(nonzero[1])
+    margin = 100  # Хайх талбайн өргөн
+
+    # Өмнөх шугамын дагуу хайж олох
+    left_lane_inds = (
+        (nonzero_x > (left_fit_pixel[0] * (nonzero_y ** 2) + left_fit_pixel[1] * nonzero_y + left_fit_pixel[2] - margin)) &
+        (nonzero_x < (left_fit_pixel[0] * (nonzero_y ** 2) + left_fit_pixel[1] * nonzero_y + left_fit_pixel[2] + margin))
+    )
+    right_lane_inds = (
+        (nonzero_x > (right_fit_pixel[0] * (nonzero_y ** 2) + right_fit_pixel[1] * nonzero_y + right_fit_pixel[2] - margin)) &
+        (nonzero_x < (right_fit_pixel[0] * (nonzero_y ** 2) + right_fit_pixel[1] * nonzero_y + right_fit_pixel[2] + margin))
+    )
+
+    # Илэрсэн пикселүүдийг хадгалах
+    line_lt.all_x, line_lt.all_y = nonzero_x[left_lane_inds], nonzero_y[left_lane_inds]
+    line_rt.all_x, line_rt.all_y = nonzero_x[right_lane_inds], nonzero_y[right_lane_inds]
+
+    detected = True  # Замын шугам илэрсэн эсэхийг тэмдэглэх
+    if not list(line_lt.all_x) or not list(line_lt.all_y):
+        left_fit_pixel = line_lt.last_fit_pixel
+        left_fit_meter = line_lt.last_fit_meter
+        detected = False
+    else:
+        left_fit_pixel = np.polyfit(line_lt.all_y, line_lt.all_x, 2)  # Зүүн шугамыг дахин тохируулах
+        left_fit_meter = np.polyfit(line_lt.all_y * ym_per_pix, line_lt.all_x * xm_per_pix, 2)
+
+    if not list(line_rt.all_x) or not list(line_rt.all_y):
+        right_fit_pixel = line_rt.last_fit_pixel
+        right_fit_meter = line_rt.last_fit_meter
+        detected = False
+    else:
+        right_fit_pixel = np.polyfit(line_rt.all_y, line_rt.all_x, 2)  # Баруун шугамыг дахин тохируулах
+        right_fit_meter = np.polyfit(line_rt.all_y * ym_per_pix, line_rt.all_x * xm_per_pix, 2)
+
+    line_lt.update_line(left_fit_pixel, left_fit_meter, detected=detected)
+    line_rt.update_line(right_fit_pixel, right_fit_meter, detected=detected)
+
+    # Шугам зурж харуулах өгөгдлүүдийг үүсгэх
+    ploty = np.linspace(0, height - 1, height)
+    left_fitx = left_fit_pixel[0] * ploty ** 2 + left_fit_pixel[1] * ploty + left_fit_pixel[2]
+    right_fitx = right_fit_pixel[0] * ploty ** 2 + right_fit_pixel[1] * ploty + right_fit_pixel[2]
+
+    # Хайлт хийх цонх болон шугамыг дүрслэх зураг үүсгэх
+    img_fit = np.dstack((birdeye_binary, birdeye_binary, birdeye_binary)) * 255
+    window_img = np.zeros_like(img_fit)
+
+    # Шугамуудыг тэмдэглэх
+    img_fit[nonzero_y[left_lane_inds], nonzero_x[left_lane_inds]] = [255, 0, 0]
+    img_fit[nonzero_y[right_lane_inds], nonzero_x[right_lane_inds]] = [0, 0, 255]
+
+    # Хайлт хийх цонхны хүрээг харуулах
+    left_line_window1 = np.array([np.transpose(np.vstack([left_fitx - margin, ploty]))])
+    left_line_window2 = np.array([np.flipud(np.transpose(np.vstack([left_fitx + margin, ploty])))])
+    left_line_pts = np.hstack((left_line_window1, left_line_window2))
+    right_line_window1 = np.array([np.transpose(np.vstack([right_fitx - margin, ploty]))])
+    right_line_window2 = np.array([np.flipud(np.transpose(np.vstack([right_fitx + margin, ploty])))])
+    right_line_pts = np.hstack((right_line_window1, right_line_window2))
+
+    # Ногоон өнгөөр шугамуудын хүрээг тэмдэглэх
+    cv2.fillPoly(window_img, np.int_([left_line_pts]), (0, 255, 0))
+    cv2.fillPoly(window_img, np.int_([right_line_pts]), (0, 255, 0))
+    result = cv2.addWeighted(img_fit, 1, window_img, 0.3, 0)
+
+    # Дүрслэл гаргах
+    if verbose:
+        plt.imshow(result)
+        plt.plot(left_fitx, ploty, color='yellow')
+        plt.plot(right_fitx, ploty, color='yellow')
+        plt.xlim(0, 1280)
+        plt.ylim(720, 0)
+
+        plt.show()
+
+    return line_lt, line_rt, img_fit
